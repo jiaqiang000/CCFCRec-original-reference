@@ -15,6 +15,8 @@ from extract_img_feature import get_img_feature_pickle
 
 
 # [代码作用] 将 Amazon 原始 user id 映射成 0...N-1 的连续整数，便于直接索引 user_embedding。
+# [注意] 这里只把原始 user ID 映射成连续整数索引，不生成 embedding。
+# s_u 来自 user_embedding[user]；user_embedding 在模型初始化时创建，并通过 L_z、L_q 的 BPR 训练不断更新。
 def serialize_user(user_set):
     user_set = set(user_set)
     user_idx = 0
