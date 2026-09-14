@@ -61,6 +61,7 @@ class CCFCRec(nn.Module):
         #   user_embedding[user]：承担论文 UCE s_u 的角色
         #   item_embedding[item]：承担论文 COCE z_v 的角色
         # 这两套 embedding 来自协同侧，训练时参与 BPR/对比学习；严格冷启动测试物品不能依赖 item_embedding。
+        # [当前默认流程] pretrain=False：从零创建 user_embedding（UCE s_u）和 item_embedding（COCE z_v），随机初始化后随训练更新。
         if args.pretrain is True:
             if args.pretrain_update is True:
                 self.user_embedding = nn.Parameter(torch.load('user_emb.pt'), requires_grad=True)
@@ -72,9 +73,9 @@ class CCFCRec(nn.Module):
             self.user_embedding = nn.Parameter(torch.FloatTensor(args.user_number, args.implicit_dim))
             self.item_embedding = nn.Parameter(torch.FloatTensor(args.item_number, args.implicit_dim))
 
-        # 定义生成层，将(q_v_a, u)的信息，共同生成 q_v_c， 生成包含协同信息的item嵌入
-        # [论文对应] 这两层 MLP 可以理解为 Figure 2 中 Content CF Module / CBCE encoder g_c 的核心实现。
-        # [注意] 原注释提到“(q_v_a, u)”，但当前 forward 实际送入 gen_layer 的只有 q_v_a，并没有直接拼接 user embedding。
+        # 定义生成层：q_v_a（约对应 Figure 2 的内容表示 c_v）-> g_c -> q_v_c（对应 Figure 2 的 CBCE q_v）
+        # [论文对应] 这两层 MLP 是 Figure 2 中 Content CF Module / CBCE encoder g_c 的核心实现。
+        # [注意] 原注释称输入为(q_v_a, u)，但当前 forward 实际只输入 q_v_a（≈c_v），没有直接输入用户表示 s_u。
         self.gen_layer1 = nn.Linear(args.attr_present_dim*2, args.cat_implicit_dim)
         self.gen_layer2 = nn.Linear(args.attr_present_dim, args.attr_present_dim)
 
@@ -146,10 +147,10 @@ def train(model, train_loader, optimizer, valida, args, model_save_dir):
     # ============================================================
     # [阅读重点] 第 4/5 步：train() 是理解论文三个 Loss 的核心。
     # 每个 batch 的主流程：
-    #   A. 内容 -> q_v_c（CBCE q_v）
-    #   B. q_v_c 与协同 item embedding 做对比学习（L_c）
-    #   C. item_embedding + user_embedding 做 BPR（L_z）
-    #   D. q_v_c + user_embedding 再做 BPR（L_q）
+    #   A. 内容 -> q_v_c（Figure 2：CBCE q_v）
+    #   B. q_v_c（q_v）与 item_embedding（COCE z_v）做对比学习（L_c）
+    #   C. item_embedding（z_v）+ user_embedding（UCE s_u）做 BPR（L_z）
+    #   D. q_v_c（q_v）+ user_embedding（s_u）再做 BPR（L_q）
     #   E. 合成 total_loss -> backward() -> optimizer.step()
     # ============================================================
     print("model start train!")
@@ -182,38 +183,35 @@ def train(model, train_loader, optimizer, valida, args, model_save_dir):
             negative_item_list = negative_item_list.to(device)
 
             # ========================================================
-            # [训练阶段 A] Content -> CBCE q_v
+            # [训练阶段 A] Content -> q_v_c（Figure 2：CBCE q_v）
             # ========================================================
-            # [论文符号] q_v_c ≈ q_v。
+            # 调用 forward()，由当前物品的类别和图像侧信息生成 q_v_c（论文 CBCE q_v）。
             q_v_c = model(item_genres, item_img_feature, user.shape[0])
             q_v_c_unsqueeze = q_v_c.unsqueeze(dim=1)
 
             # ========================================================
-            # [训练阶段 B] Contrastive Learning：计算 L_c
+            # [训练阶段 B] Contrastive Learning：q_v（q_v_c）↔ COCE z_v（item_embedding），计算 L_c
             # ========================================================
-            # compute contrast loss
-            # [论文对应] positive_item_list 来自 support.py 的协同正物品采样。
-            # item_embedding[...] 承担论文 COCE z_{v+} 的角色。
+            # [实现对应] 论文写作 v -> g_v -> z_v；当前代码直接用可学习的 item_embedding 承担 COCE z_v 的角色。
+            # 正样本：取与当前物品具有协同关联的物品，其 item_embedding 对应论文 z_{v+}。
             positive_item_emb = model.item_embedding[positive_item_list]
 
-            # [论文公式] cosine(q_v, z_{v+}) / tau。
-            # 分子是点积，分母用两个向量的范数做归一化，所以这里计算的是余弦相似度，再除温度 tau。
+            # 计算 q_v 与正物品 z_{v+} 的余弦相似度 / tau，希望二者更接近。
             pos_contrast_mul = torch.sum(torch.mul(q_v_c_unsqueeze, positive_item_emb), dim=2) / (
                     args.tau * torch.norm(q_v_c_unsqueeze, dim=2) * torch.norm(positive_item_emb, dim=2))
             pos_contrast_exp = torch.exp(pos_contrast_mul)  # shape = 1024*10
 
-            # negative samples
-            # [论文对应] 负协同物品的 COCE z_{v-}。
+            # 负样本：取负物品的 COCE z_{v-}，用于让 q_v 与这些协同不相关物品拉远。
             neg_item_emb = model.item_embedding[negative_item_list]
             q_v_c_un2squeeze = q_v_c_unsqueeze.unsqueeze(dim=1)
 
-            # [论文公式] cosine(q_v, z_{v-}) / tau。
+            # 计算 q_v 与负物品 z_{v-} 的余弦相似度 / tau。
             neg_contrast_mul = torch.sum(torch.mul(q_v_c_un2squeeze, neg_item_emb), dim=3) / (
                     args.tau * torch.norm(q_v_c_un2squeeze, dim=3) * torch.norm(neg_item_emb, dim=3))
             neg_contrast_exp = torch.exp(neg_contrast_mul)
             neg_contrast_sum = torch.sum(neg_contrast_exp, dim=2)  # shape = [1024, 10]
 
-            # [论文对应] InfoNCE 风格：让 q_v 更接近正物品 COCE，并远离对应负物品 COCE。
+            # InfoNCE：让 q_v 更接近正物品 z_{v+}，并远离负物品 z_{v-}。
             contrast_val = -torch.log(pos_contrast_exp / (pos_contrast_exp + neg_contrast_sum))  # shape = [1024*10]
             contrast_examples_num = contrast_val.shape[0] * contrast_val.shape[1]
             contrast_sum = torch.sum(torch.sum(contrast_val, dim=1), dim=0) / contrast_val.shape[1]  # 同一个batch求mean
@@ -221,9 +219,7 @@ def train(model, train_loader, optimizer, valida, args, model_save_dir):
             '''
             contrast self
             '''
-            # [代码实现细节] 除“协同正物品”对比外，官方实现还加入当前 item 自身的 COCE 作为正例：
-            # q_v_c（内容生成的 CBCE）与 item_embedding[item]（当前物品 COCE）做 self contrast。
-            # 这部分最终以 self_contrast_sum 加入 total_loss。
+            # [代码额外实现] 除 q_v ↔ z_{v+} 外，还让 q_v 与当前物品自身的 COCE z_v 拉近，并与 self_neg_list 中负物品拉远。
             self_neg_item_emb = model.item_embedding[self_neg_list]
             self_neg_contrast_mul = torch.sum(torch.mul(q_v_c_unsqueeze, self_neg_item_emb), dim=2)/(
                 args.tau*torch.norm(q_v_c_unsqueeze, dim=2)*torch.norm(self_neg_item_emb, dim=2))
@@ -236,45 +232,36 @@ def train(model, train_loader, optimizer, valida, args, model_save_dir):
             self_contrast_sum = torch.sum(self_contrast_val)
 
             # ========================================================
-            # [训练阶段 C] COCE 路径的 BPR：L_z
+            # [训练阶段 C] COCE 路径：z_v（item_emb）+ s_u（user_emb）-> f_z -> BPR L_z
             # ========================================================
-            # rank loss
-            # [论文符号]
-            #   user_emb     ≈ s_{u+}（正用户 UCE）
-            #   item_emb     ≈ z_v（当前物品 COCE）
-            #   neg_user_emb ≈ s_{u-}（负用户 UCE）
+            # 对当前物品 z_v，分别取交互过它的正用户 s_{u+} 和负用户 s_{u-}，要求正用户得分更高。
             user_emb = model.user_embedding[user]
             item_emb = model.item_embedding[item]
             neg_user_emb = model.user_embedding[neg_user]
             logsigmoid = torch.nn.LogSigmoid()
 
-            # [论文对应] f_z 使用内积作为预测器。
-            # 正用户得分 y_uv = z_v · s_{u+}；负用户得分 y_kv = z_v · s_{u-}。
+            # f_z：分别计算 z_v 与正/负用户的内积推荐分数。
             y_uv = torch.mul(item_emb, user_emb).sum(dim=1)
             y_kv = torch.mul(item_emb, neg_user_emb).sum(dim=1)
 
-            # [论文对应] BPR：希望正用户得分 > 负用户得分。
-            # y_ukv 承担论文 L_z 的角色。
+            # L_z：BPR 要求正用户分数 y_uv > 负用户分数 y_kv。
             y_ukv = -logsigmoid(y_uv - y_kv).sum()
 
             # ========================================================
-            # [训练阶段 D] CBCE 路径的 BPR：L_q
+            # [训练阶段 D] CBCE 路径：q_v（q_v_c）+ s_u（user_emb）-> f_q -> BPR L_q
             # ========================================================
-            # 使用属性生成item嵌入，再做一个bpr排序
-            # [论文对应] 与上面完全相同的 BPR 思想，只是把 COCE item_emb 换成 CBCE q_v_c。
-            # f_q 同样使用内积作为预测器。
+            # 与上面的 L_z 相同，只是把协同表示 z_v 换成由侧信息生成的 q_v。
             y_uv2 = torch.mul(q_v_c, user_emb).sum(dim=1)
             y_kv2 = torch.mul(q_v_c, neg_user_emb).sum(dim=1)
 
-            # [论文对应] y_ukv2 承担论文 L_q 的角色。
+            # L_q：同样要求正用户对 q_v 的得分高于负用户。
             y_ukv2 = -logsigmoid(y_uv2 - y_kv2).sum()
 
             # ========================================================
             # [训练阶段 E] 合并总 Loss
             # ========================================================
-            # [代码实现] contrast_sum + self_contrast_sum 是对比学习部分；y_ukv + y_ukv2 是两条 BPR 路径。
-            # lambda1 控制二者权重。注意这里官方代码写成 lambda1 与 (1-lambda1) 的加权形式，
-            # 阅读时应以实际代码为准，不要只按论文公式字面猜实现。
+            # 对比学习 L_c 与两条 BPR 路径 L_z、L_q 联合训练；lambda1 控制两部分权重。
+            # 注意官方代码采用 lambda1 与 (1-lambda1) 的加权形式，阅读时以实际代码为准。
             total_loss = args.lambda1*(contrast_sum+self_contrast_sum) + (1-args.lambda1)*(y_ukv+y_ukv2)
             if math.isnan(total_loss):
                 print("loss is nan!, exit.", total_loss)
