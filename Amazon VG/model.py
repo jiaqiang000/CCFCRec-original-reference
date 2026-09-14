@@ -171,6 +171,18 @@ def train(model, train_loader, optimizer, valida, args, model_save_dir):
     for i_epoch in range(args.epoch):
         i_batch = 0
         batch_time = time.time()
+        # user                当前正用户
+        # item                当前物品
+        #
+        # item_genres         当前物品的 category/attribute
+        # item_img_feature    当前物品的图像特征
+        #
+        # neg_user            BPR 用的负用户
+        #
+        # positive_item_list  对比学习用的正物品
+        # negative_item_list  对比学习用的负物品
+        #
+        # self_neg_list       self contrast 用的负物品
         for user, item, item_genres, item_img_feature, neg_user, positive_item_list, negative_item_list, self_neg_list in tqdm(train_loader):
             # [代码作用] 清空上一批次的梯度。
             optimizer.zero_grad()
