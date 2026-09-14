@@ -43,7 +43,7 @@ class CCFCRec(nn.Module):
         self.attr_matrix = torch.nn.Parameter(torch.FloatTensor(args.attr_num, args.attr_present_dim))
 
         # 定义属性attribute注意力层
-        # [可学习参数][内容侧] 用于为不同 category/attribute 计算 attention 分数。
+        # [可学习参数][内容侧] 学习各 category/attribute 的重要性分数；对物品已有属性做 Attention 加权融合，最终得到属性侧表示 final_attr_emb（非最终 CBCE）
         self.attr_W1 = torch.nn.Parameter(torch.FloatTensor(args.attr_present_dim, args.attr_present_dim))
         self.attr_b1 = torch.nn.Parameter(torch.FloatTensor(args.attr_present_dim, 1))
         self.attr_W2 = torch.nn.Parameter(torch.FloatTensor(args.attr_present_dim, 1))
@@ -70,6 +70,7 @@ class CCFCRec(nn.Module):
                 self.user_embedding = nn.Parameter(torch.load('user_emb.pt'), requires_grad=False)
                 self.item_embedding = nn.Parameter(torch.load('item_emb.pt'), requires_grad=False)
         else:
+            # 默认流程在这里
             self.user_embedding = nn.Parameter(torch.FloatTensor(args.user_number, args.implicit_dim))
             self.item_embedding = nn.Parameter(torch.FloatTensor(args.item_number, args.implicit_dim))
 
@@ -82,6 +83,8 @@ class CCFCRec(nn.Module):
         # 参数初始化
         self.__init_param__()
 
+        #你现在完全不需要深究 Xavier 的数学公式，只需要知道：
+        #这些参数刚创建出来的时候总得先有一些数值，不能全都乱来，所以用一种常见的初始化方法给它们设置合理的随机初值。之后真正的训练再不断修改这些数值。
     def __init_param__(self):
         # [代码作用] Xavier 初始化只决定训练开始时参数的初值；这些参数之后仍会由反向传播继续学习。
         nn.init.xavier_normal_(self.attr_matrix)
